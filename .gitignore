@@ -1,0 +1,10 @@
+.venv/
+vendor/
+data/
+runs/
+*.pt
+*.pth
+*.safetensors
+__pycache__/
+*.pyc
+.env

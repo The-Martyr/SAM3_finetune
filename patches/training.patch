@@ -1,0 +1,915 @@
+diff --git a/sam3/model/decoder.py b/sam3/model/decoder.py
+index 578a2bf..04fef54 100644
+--- a/sam3/model/decoder.py
++++ b/sam3/model/decoder.py
+@@ -400,8 +400,6 @@ class TransformerDecoder(nn.Module):
+                 deltas_x = torch.cat([deltas_x, deltas_x_log], dim=-1)
+                 deltas_y = torch.cat([deltas_y, deltas_y_log], dim=-1)
+ 
+-        if self.training:
+-            assert self.use_act_checkpoint, "activation ckpt not enabled in decoder"
+         deltas_x = activation_ckpt_wrapper(self.boxRPB_embed_x)(
+             x=deltas_x,
+             act_ckpt_enable=self.training and self.use_act_checkpoint,
+@@ -556,10 +554,6 @@ class TransformerDecoder(nn.Module):
+                     (spatial_shapes[0, 0], spatial_shapes[0, 1]),
+                 )
+                 memory_mask = memory_mask.flatten(0, 1)  # (bs*n_heads, nq, H*W)
+-            if self.training:
+-                assert self.use_act_checkpoint, (
+-                    "Activation checkpointing not enabled in the decoder"
+-                )
+             output, presence_out = activation_ckpt_wrapper(layer)(
+                 tgt=output,
+                 tgt_query_pos=query_pos,
+diff --git a/sam3/model/encoder.py b/sam3/model/encoder.py
+index 17f5161..888666d 100644
+--- a/sam3/model/encoder.py
++++ b/sam3/model/encoder.py
+@@ -440,8 +440,6 @@ class TransformerEncoder(nn.Module):
+             layer_kwargs["tgt"] = output
+             layer_kwargs["tgt_key_padding_mask"] = key_padding_masks_flatten
+ 
+-            if self.training:
+-                assert self.use_act_checkpoint, "activation ckpt not enabled in encoder"
+             if encoder_extra_kwargs is not None:
+                 layer_kwargs.update(encoder_extra_kwargs)
+             output = activation_ckpt_wrapper(layer)(
+diff --git a/sam3/model/vitdet.py b/sam3/model/vitdet.py
+index fe8e402..6f00fe6 100644
+--- a/sam3/model/vitdet.py
++++ b/sam3/model/vitdet.py
+@@ -68,7 +68,13 @@ class Mlp(nn.Module):
+         self.drop2 = nn.Dropout(drop_probs[1])
+ 
+     def forward(self, x):
+-        x = addmm_act(type(self.act), self.fc1, x)
++        # The release fused op is inference-only and explicitly rejects grad.
++        # Preserve it for frozen V, while using the mathematically equivalent
++        # trainable path when the vision tower is unfrozen.
++        if torch.is_grad_enabled():
++            x = self.act(self.fc1(x))
++        else:
++            x = addmm_act(type(self.act), self.fc1, x)
+         x = self.drop1(x)
+         x = self.norm(x)
+         x = self.fc2(x)
+diff --git a/sam3/model/vl_combiner.py b/sam3/model/vl_combiner.py
+index c07fe91..1d2032c 100644
+--- a/sam3/model/vl_combiner.py
++++ b/sam3/model/vl_combiner.py
+@@ -47,6 +47,8 @@ class SAM3VLBackbone(nn.Module):
+         # allow running activation checkpointing on the entire vision and language backbones
+         self.act_ckpt_whole_vision_backbone = act_ckpt_whole_vision_backbone
+         self.act_ckpt_whole_language_backbone = act_ckpt_whole_language_backbone
++        self.freeze_vision_forward = False
++        self.freeze_text_forward = False
+ 
+     def forward(
+         self,
+@@ -79,10 +81,15 @@ class SAM3VLBackbone(nn.Module):
+         return output
+ 
+     def forward_image(self, samples: torch.Tensor):
+-        return activation_ckpt_wrapper(self._forward_image_no_act_ckpt)(
+-            samples=samples,
+-            act_ckpt_enable=self.act_ckpt_whole_vision_backbone and self.training,
+-        )
++        with torch.set_grad_enabled(not self.freeze_vision_forward):
++            return activation_ckpt_wrapper(self._forward_image_no_act_ckpt)(
++                samples=samples,
++                act_ckpt_enable=(
++                    self.act_ckpt_whole_vision_backbone
++                    and self.training
++                    and not self.freeze_vision_forward
++                ),
++            )
+ 
+     def _forward_image_no_act_ckpt(self, samples):
+         # Forward through backbone
+@@ -124,13 +131,18 @@ class SAM3VLBackbone(nn.Module):
+     def forward_text(
+         self, captions, input_boxes=None, additional_text=None, device="cuda"
+     ):
+-        return activation_ckpt_wrapper(self._forward_text_no_ack_ckpt)(
+-            captions=captions,
+-            input_boxes=input_boxes,
+-            additional_text=additional_text,
+-            device=device,
+-            act_ckpt_enable=self.act_ckpt_whole_language_backbone and self.training,
+-        )
++        with torch.set_grad_enabled(not self.freeze_text_forward):
++            return activation_ckpt_wrapper(self._forward_text_no_ack_ckpt)(
++                captions=captions,
++                input_boxes=input_boxes,
++                additional_text=additional_text,
++                device=device,
++                act_ckpt_enable=(
++                    self.act_ckpt_whole_language_backbone
++                    and self.training
++                    and not self.freeze_text_forward
++                ),
++            )
+ 
+     def _forward_text_no_ack_ckpt(
+         self,
+diff --git a/sam3/model_builder.py b/sam3/model_builder.py
+index 602906b..8217265 100644
+--- a/sam3/model_builder.py
++++ b/sam3/model_builder.py
+@@ -579,6 +579,10 @@ def build_sam3_image_model(
+     enable_segmentation=True,
+     enable_inst_interactivity=False,
+     compile=False,
++    freeze_policy=None,
++    activation_checkpointing=True,
++    compile_vision_only=False,
++    activation_checkpoint_mode="all",
+ ):
+     """
+     Build SAM3 image model
+@@ -601,7 +605,7 @@ def build_sam3_image_model(
+         )
+ 
+     # Create visual components
+-    compile_mode = "default" if compile else None
++    compile_mode = "default" if (compile or compile_vision_only) else None
+     vision_encoder = _create_vision_backbone(
+         compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+     )
+@@ -620,7 +624,7 @@ def build_sam3_image_model(
+ 
+     # Create segmentation head if enabled
+     segmentation_head = (
+-        _create_segmentation_head(compile_mode=compile_mode)
++        _create_segmentation_head(compile_mode=("default" if compile else None))
+         if enable_segmentation
+         else None
+     )
+@@ -648,6 +652,48 @@ def build_sam3_image_model(
+     if checkpoint_path is not None:
+         _load_checkpoint(model, checkpoint_path)
+ 
++    if freeze_policy is not None:
++        from sam3.train.freeze_policy import apply_freeze_policy
++
++        apply_freeze_policy(model, freeze_policy)
++
++    if not activation_checkpointing:
++        checkpoint_attrs = (
++            "use_act_checkpoint", "use_act_ckpt", "act_ckpt",
++            "grad_checkpointing", "use_act_checkpoint_seg_head",
++            "act_ckpt_whole_vision_backbone", "act_ckpt_whole_language_backbone",
++        )
++        for module in model.modules():
++            for attr in checkpoint_attrs:
++                if hasattr(module, attr):
++                    setattr(module, attr, False)
++    elif activation_checkpoint_mode == "text_off":
++        for child in model.backbone.language_backbone.modules():
++            for attr in ("use_act_checkpoint", "use_act_ckpt", "grad_checkpointing"):
++                if hasattr(child, attr): setattr(child, attr, False)
++    elif activation_checkpoint_mode in ("encoder_off", "geometry_off"):
++        module = (
++            model.transformer.encoder
++            if activation_checkpoint_mode == "encoder_off"
++            else model.geometry_encoder
++        )
++        for child in module.modules():
++            for attr in ("use_act_checkpoint", "use_act_ckpt", "grad_checkpointing"):
++                if hasattr(child, attr): setattr(child, attr, False)
++    elif activation_checkpoint_mode == "selective":
++        # Preserve checkpointing for the dynamic, memory-heavy decoder and
++        # segmentation head; avoid recompute in the cheaper upstream modules.
++        for module in (
++            model.backbone.language_backbone,
++            model.geometry_encoder,
++            model.transformer.encoder,
++        ):
++            for child in module.modules():
++                for attr in ("use_act_checkpoint", "use_act_ckpt", "grad_checkpointing"):
++                    if hasattr(child, attr): setattr(child, attr, False)
++    elif activation_checkpoint_mode != "all":
++        raise ValueError(f"Unknown activation_checkpoint_mode={activation_checkpoint_mode}")
++
+     # Setup device and mode
+     model = _setup_device_and_mode(model, device, eval_mode)
+ 
+diff --git a/sam3/train/data/collator.py b/sam3/train/data/collator.py
+index 838a122..0124df1 100644
+--- a/sam3/train/data/collator.py
++++ b/sam3/train/data/collator.py
+@@ -2,7 +2,7 @@
+ 
+ # pyre-unsafe
+ 
+-from dataclasses import dataclass, field as field_ptr_behaviour, fields, is_dataclass
++from dataclasses import dataclass, field as field_ptr_behaviour, fields, is_dataclass, replace
+ from typing import Any, get_args, get_origin, List, Union
+ 
+ import torch
+@@ -19,6 +19,82 @@ from .sam3_image_dataset import Datapoint
+ MyTensor = Union[torch.Tensor, List[Any]]
+ 
+ 
++@dataclass
++class QueryMicrobatchGroup:
++    """Sequential query chunks from one already-augmented image datapoint."""
++
++    chunks: List[dict]
++    original_query_count: int
++
++
++def collate_fn_api_with_query_microbatching(
++    batch,
++    max_queries_per_microbatch,
++    max_outputs_per_microbatch,
++    dict_key,
++    with_seg_masks=False,
++    input_points_embedding_dim=257,
++    repeats: int = 0,
++    load_image_in_fp16: bool = False,
++):
++    """Split queries only after dataset transforms have run once.
++
++    This is intentionally restricted to local batch one. Each collated chunk
++    contains only targets referenced by its query slice, while sharing the
++    same already-augmented image tensor. The trainer accumulates all chunks
++    into one optimizer step using full-query-batch normalization.
++    """
++    assert len(batch) == 1, "per-image query microbatching requires local batch 1"
++    assert max_queries_per_microbatch >= 1
++    assert max_outputs_per_microbatch >= 1
++    datapoint = batch[0]
++    queries = datapoint.find_queries
++    assert queries, "datapoint has no find queries"
++    query_slices = []
++    current = []
++    current_outputs = 0
++    for query in queries:
++        n_outputs = len(query.object_ids_output)
++        # A single query is indivisible. The training view guarantees it does
++        # not exceed the upstream per-query cap (200).
++        assert n_outputs <= max_outputs_per_microbatch, (
++            f"single query has {n_outputs} outputs, above microbatch budget "
++            f"{max_outputs_per_microbatch}"
++        )
++        if current and (
++            len(current) >= max_queries_per_microbatch
++            or current_outputs + n_outputs > max_outputs_per_microbatch
++        ):
++            query_slices.append(current)
++            current = []
++            current_outputs = 0
++        current.append(query)
++        current_outputs += n_outputs
++    if current:
++        query_slices.append(current)
++
++    chunks = []
++    for query_slice in query_slices:
++        micro_datapoint = replace(
++            datapoint,
++            find_queries=query_slice,
++        )
++        chunks.append(
++            collate_fn_api(
++                [micro_datapoint],
++                dict_key,
++                with_seg_masks,
++                input_points_embedding_dim,
++                repeats,
++                load_image_in_fp16,
++            )
++        )
++    return QueryMicrobatchGroup(
++        chunks=chunks,
++        original_query_count=len(queries),
++    )
++
++
+ def convert_my_tensors(obj):
+     def is_optional_field(field) -> bool:
+         return get_origin(field) is Union and type(None) in get_args(field)
+diff --git a/sam3/train/data/sam3_image_dataset.py b/sam3/train/data/sam3_image_dataset.py
+index cc10de5..e16c463 100644
+--- a/sam3/train/data/sam3_image_dataset.py
++++ b/sam3/train/data/sam3_image_dataset.py
+@@ -458,6 +458,7 @@ class Sam3ImageDataset(CustomCocoDetectionAPI):
+         zstd_dict_path=None,
+         filter_query=None,
+         coco_json_loader: Callable = COCO_FROM_JSON,
++        max_total_ann_per_img: Optional[int] = None,
+         # pyrefly: ignore [bad-function-definition]
+         limit_ids: int = None,
+     ):
+@@ -478,6 +479,7 @@ class Sam3ImageDataset(CustomCocoDetectionAPI):
+         self._transforms = transforms
+         self.training = training
+         self.max_ann_per_img = max_ann_per_img
++        self.max_total_ann_per_img = max_total_ann_per_img
+         self.max_train_queries = max_train_queries
+         self.max_val_queries = max_val_queries
+ 
+@@ -507,6 +509,13 @@ class Sam3ImageDataset(CustomCocoDetectionAPI):
+                             f"Too many outputs ({len(q.object_ids_output)})"
+                         )
+ 
++                if self.max_total_ann_per_img is not None:
++                    total_objects = sum(len(image.objects) for image in datapoint.images)
++                    if total_objects > self.max_total_ann_per_img:
++                        raise DecompressionBombError(
++                            f"Too many total objects ({total_objects})"
++                        )
++
+                 max_queries = (
+                     self.max_train_queries if self.training else self.max_val_queries
+                 )
+diff --git a/sam3/train/loss/loss_fns.py b/sam3/train/loss/loss_fns.py
+index e6d2396..94ed8c5 100644
+--- a/sam3/train/loss/loss_fns.py
++++ b/sam3/train/loss/loss_fns.py
+@@ -6,6 +6,7 @@ import logging
+ import warnings
+ 
+ import torch
++import os
+ import torch.distributed
+ import torch.nn.functional as F
+ import torchmetrics
+@@ -85,6 +86,13 @@ def dice_loss(inputs, targets, num_boxes, loss_on_multimask=False, reduce=True):
+                  classification label for each element in inputs
+                 (0 for the negative class and 1 for the positive class).
+     """
++    if (
++        os.environ.get("SAM3_CHUNKED_NATIVE_DICE", "0") == "1"
++        and reduce
++        and not loss_on_multimask
++    ):
++        max_numel = int(os.environ.get("SAM3_NATIVE_DICE_MAX_NUMEL", "1000000"))
++        return _ChunkedNativeDiceReduced.apply(inputs, targets, max_numel) / num_boxes
+     try:
+         loss = _dice_loss(inputs, targets, num_boxes, loss_on_multimask, reduce)
+     except torch.OutOfMemoryError:
+@@ -101,6 +109,51 @@ def dice_loss(inputs, targets, num_boxes, loss_on_multimask=False, reduce=True):
+     return loss
+ 
+ 
++class _ChunkedNativeDiceReduced(torch.autograd.Function):
++    """Exact reduced sigmoid-Dice with instance-chunked analytic backward."""
++
++    @staticmethod
++    def forward(ctx, inputs, targets, max_numel):
++        assert inputs.shape == targets.shape
++        assert inputs.ndim >= 2
++        ctx.save_for_backward(inputs, targets)
++        ctx.max_numel = int(max_numel)
++        if inputs.shape[0] == 0:
++            ctx.instances_per_chunk = 1
++            return torch.zeros((), device=inputs.device, dtype=torch.float32)
++        per_instance = inputs[0].numel()
++        ctx.instances_per_chunk = max(1, ctx.max_numel // per_instance)
++        total = torch.zeros((), device=inputs.device, dtype=torch.float32)
++        for start in range(0, inputs.shape[0], ctx.instances_per_chunk):
++            x = inputs[start : start + ctx.instances_per_chunk].float().flatten(1)
++            y = targets[start : start + ctx.instances_per_chunk].float().flatten(1)
++            prob = x.sigmoid()
++            numerator = 2.0 * (prob * y).sum(1) + 1.0
++            denominator = prob.sum(1) + y.sum(1) + 1.0
++            total.add_((1.0 - numerator / denominator).sum())
++        return total
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        inputs, targets = ctx.saved_tensors
++        grad_inputs = torch.empty_like(inputs)
++        for start in range(0, inputs.shape[0], ctx.instances_per_chunk):
++            stop = min(start + ctx.instances_per_chunk, inputs.shape[0])
++            x = inputs[start:stop].float().flatten(1)
++            y = targets[start:stop].float().flatten(1)
++            prob = x.sigmoid()
++            numerator = 2.0 * (prob * y).sum(1, keepdim=True) + 1.0
++            denominator = (
++                prob.sum(1, keepdim=True) + y.sum(1, keepdim=True) + 1.0
++            )
++            grad_prob = (
++                numerator - 2.0 * y * denominator
++            ) / denominator.square()
++            grad = grad_prob * prob * (1.0 - prob) * grad_output.float()
++            grad_inputs[start:stop].copy_(grad.reshape_as(inputs[start:stop]).to(inputs.dtype))
++        return grad_inputs, None, None
++
++
+ def _dice_loss(inputs, targets, num_boxes, loss_on_multimask=False, reduce=True):
+     inputs = inputs.sigmoid()
+     if loss_on_multimask:
+@@ -122,6 +175,74 @@ def _dice_loss(inputs, targets, num_boxes, loss_on_multimask=False, reduce=True)
+     return loss.sum() / num_boxes
+ 
+ 
++class _ChunkedNativeFocalReduced(torch.autograd.Function):
++    """Memory-bounded reduced focal loss with an analytic chunked backward.
++
++    A normal Python loop over focal-loss chunks is not backward-memory-bounded:
++    autograd retains every chunk's sigmoid/BCE intermediates until the final
++    scalar backward.  This function saves only logits and targets, then
++    recomputes the analytic derivative one flat chunk at a time.
++    """
++
++    @staticmethod
++    def forward(ctx, inputs, targets, alpha, gamma, max_numel):
++        ctx.save_for_backward(inputs, targets)
++        ctx.alpha = float(alpha)
++        ctx.gamma = float(gamma)
++        ctx.max_numel = int(max_numel)
++
++        flat_inputs = inputs.reshape(-1)
++        flat_targets = targets.reshape(-1)
++        total = torch.zeros((), device=inputs.device, dtype=torch.float32)
++        for start in range(0, flat_inputs.numel(), ctx.max_numel):
++            x = flat_inputs[start : start + ctx.max_numel].float()
++            y = flat_targets[start : start + ctx.max_numel].float()
++            prob = x.sigmoid()
++            ce = F.binary_cross_entropy_with_logits(x, y, reduction="none")
++            one_minus_pt = y * (1.0 - prob) + (1.0 - y) * prob
++            cur = ce * one_minus_pt.pow(ctx.gamma)
++            if ctx.alpha >= 0:
++                alpha_t = ctx.alpha * y + (1.0 - ctx.alpha) * (1.0 - y)
++                cur = alpha_t * cur
++            total.add_(cur.sum())
++        return total
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        inputs, targets = ctx.saved_tensors
++        flat_inputs = inputs.reshape(-1)
++        flat_targets = targets.reshape(-1)
++        grad_inputs = torch.empty_like(inputs)
++        flat_grad = grad_inputs.reshape(-1)
++
++        for start in range(0, flat_inputs.numel(), ctx.max_numel):
++            stop = min(start + ctx.max_numel, flat_inputs.numel())
++            x = flat_inputs[start:stop].float()
++            y = flat_targets[start:stop].float()
++            prob = x.sigmoid()
++            ce = F.binary_cross_entropy_with_logits(x, y, reduction="none")
++            one_minus_pt = y * (1.0 - prob) + (1.0 - y) * prob
++            focal_factor = one_minus_pt.pow(ctx.gamma)
++            grad = (prob - y) * focal_factor
++            if ctx.gamma != 0:
++                d_one_minus_pt = (1.0 - 2.0 * y) * prob * (1.0 - prob)
++                grad.add_(
++                    ce
++                    * ctx.gamma
++                    * one_minus_pt.clamp_min(torch.finfo(torch.float32).tiny).pow(
++                        ctx.gamma - 1.0
++                    )
++                    * d_one_minus_pt
++                )
++            if ctx.alpha >= 0:
++                alpha_t = ctx.alpha * y + (1.0 - ctx.alpha) * (1.0 - y)
++                grad.mul_(alpha_t)
++            grad.mul_(grad_output.float())
++            flat_grad[start:stop].copy_(grad.to(flat_grad.dtype))
++
++        return grad_inputs, None, None, None, None
++
++
+ def sigmoid_focal_loss(
+     inputs,
+     targets,
+@@ -149,9 +270,34 @@ def sigmoid_focal_loss(
+     """
+     if not (0 <= alpha <= 1) and triton:
+         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
++    stable_native = os.environ.get("SAM3_DISABLE_TRITON_FOCAL", "0") == "1"
++    if stable_native and reduce and not loss_on_multimask:
++        max_numel = int(os.environ.get("SAM3_NATIVE_FOCAL_MAX_NUMEL", "1000000"))
++        total = _ChunkedNativeFocalReduced.apply(
++            inputs, targets, alpha, gamma, max_numel
++        )
++        return total / (num_boxes * inputs.shape[1])
+     if triton:
+         if reduce and not loss_on_multimask:
+-            loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
++            # Triton launch metadata uses signed 32-bit indexing. Very large
++            # dynamic multi-query mask batches can exceed that range. Chunking
++            # along dim0 is mathematically identical because the fused op
++            # returns a scalar sum; autograd remains connected per chunk.
++            max_numel = int(os.environ.get("SAM3_FOCAL_TRITON_MAX_NUMEL", "1000000000"))
++            if inputs.numel() > max_numel:
++                flat_inputs = inputs.reshape(-1)
++                flat_targets = targets.reshape(-1)
++                loss = sum(
++                    triton_sigmoid_focal_loss_reduce(
++                        flat_inputs[i : i + max_numel],
++                        flat_targets[i : i + max_numel],
++                        alpha,
++                        gamma,
++                    )
++                    for i in range(0, flat_inputs.numel(), max_numel)
++                )
++            else:
++                loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
+             return loss / (num_boxes * inputs.shape[1])
+ 
+         loss = triton_sigmoid_focal_loss(inputs, targets, alpha, gamma)
+@@ -429,7 +575,12 @@ class IABCEMdetr(LossWithWeights):
+                 assert "presence_logit_dec" not in outputs
+             elif "presence_logit_dec" in outputs:
+                 presence_logits = outputs["presence_logit_dec"].view_as(keep_loss)
+-                bs = presence_logits.shape[0]
++                bs = (
++                    self._query_microbatch_find_batch_size
++                    if getattr(self, "_query_microbatch_find_batch_size", None)
++                    is not None
++                    else presence_logits.shape[0]
++                )
+                 presence_loss = sigmoid_focal_loss(
+                     presence_logits,
+                     keep_loss,
+@@ -497,14 +648,21 @@ class IABCEMdetr(LossWithWeights):
+ 
+                 loss_bce = loss_bce * loss_scales
+ 
++            full_find_bs = getattr(self, "_query_microbatch_find_batch_size", None)
+             if self.pad_n_queries is None or loss_bce.size(1) >= self.pad_n_queries:
+-                loss_bce = loss_bce.mean()
++                if full_find_bs is None:
++                    loss_bce = loss_bce.mean()
++                else:
++                    loss_bce = loss_bce.sum() / (full_find_bs * loss_bce.size(1))
+             else:
+                 assert isinstance(self.pad_n_queries, int)
+                 assert loss_bce.size(1) < self.pad_n_queries, (
+                     f"The number of predictions is more than the expected total after padding. Got {loss_bce.size(1)} predictions."
+                 )
+-                loss_bce = loss_bce.sum() / (self.pad_n_queries * loss_bce.size(0))
++                denominator_bs = (
++                    full_find_bs if full_find_bs is not None else loss_bce.size(0)
++                )
++                loss_bce = loss_bce.sum() / (self.pad_n_queries * denominator_bs)
+ 
+         bce_f1 = torchmetrics.functional.f1_score(
+             src_logits.sigmoid().flatten(),
+diff --git a/sam3/train/loss/sam3_loss.py b/sam3/train/loss/sam3_loss.py
+index 5aa5791..4472218 100644
+--- a/sam3/train/loss/sam3_loss.py
++++ b/sam3/train/loss/sam3_loss.py
+@@ -61,8 +61,39 @@ class Sam3LossWrapper(torch.nn.Module):
+         self.use_o2m_matcher_on_o2m_aux = use_o2m_matcher_on_o2m_aux
+         self.loss_fn_semantic_seg = loss_fn_semantic_seg
+         self.scale_by_find_batch_size = scale_by_find_batch_size
++        self._query_microbatch_num_boxes = None
++        self._query_microbatch_find_batch_size = None
++
++    def set_query_microbatch_normalization(
++        self, local_full_num_boxes: torch.Tensor, full_find_batch_size: int
++    ):
++        """Install normalizers corresponding to the unsplit per-image query batch."""
++        if self.normalize_by_valid_object_num:
++            raise NotImplementedError(
++                "query microbatching does not yet support normalize_by_valid_object_num"
++            )
++        num_boxes = local_full_num_boxes.float()
++        if self.normalization == "global":
++            torch.distributed.all_reduce(num_boxes)
++            num_boxes = torch.clamp(num_boxes / get_world_size(), min=1)
++        elif self.normalization == "local":
++            num_boxes = torch.clamp(num_boxes, min=1)
++        elif self.normalization == "none":
++            num_boxes = torch.ones_like(num_boxes)
++        self._query_microbatch_num_boxes = num_boxes
++        self._query_microbatch_find_batch_size = int(full_find_batch_size)
++        for loss_fn in self.loss_fns_find:
++            loss_fn._query_microbatch_find_batch_size = int(full_find_batch_size)
++
++    def clear_query_microbatch_normalization(self):
++        self._query_microbatch_num_boxes = None
++        self._query_microbatch_find_batch_size = None
++        for loss_fn in self.loss_fns_find:
++            loss_fn._query_microbatch_find_batch_size = None
+ 
+     def _get_num_boxes(self, targets):
++        if self._query_microbatch_num_boxes is not None:
++            return self._query_microbatch_num_boxes
+         # the average number of target boxes for loss normalization
+         if self.normalize_by_valid_object_num:
+             # valid boxes are those with non-zero height and width
+@@ -190,7 +221,11 @@ class Sam3LossWrapper(torch.nn.Module):
+                         cur_losses[CORE_LOSS_KEY] /= len(find_stages)
+ 
+                     if self.scale_by_find_batch_size:
+-                        bs = targets["num_boxes"].shape[0]
++                        bs = (
++                            self._query_microbatch_find_batch_size
++                            if self._query_microbatch_find_batch_size is not None
++                            else targets["num_boxes"].shape[0]
++                        )
+                         # sqrt scaling based on the "effective" batch size
+                         cur_losses[CORE_LOSS_KEY] *= bs**0.5
+ 
+diff --git a/sam3/train/optim/optimizer.py b/sam3/train/optim/optimizer.py
+index 3e9c20a..bb55bdd 100644
+--- a/sam3/train/optim/optimizer.py
++++ b/sam3/train/optim/optimizer.py
+@@ -242,9 +242,17 @@ def unix_param_pattern_to_parameter_names(
+     allowed_parameter_names = []
+     for param_name in filter_param_names:
+         matching_parameters = set(fnmatch.filter(parameter_names, param_name))
+-        assert len(matching_parameters) >= 1, (
+-            f"param_name {param_name} does not match any parameters in the model"
+-        )
++        # With an explicit freeze-policy allowlist, a scheduler pattern for a
++        # frozen tower legitimately has no optimizer parameters. The model-level
++        # freeze audit separately validates every parameter name/group, so this
++        # is not allowed to hide unclassified parameters.
++        if not matching_parameters:
++            logging.info(
++                "Skipping optimizer pattern [%s]: module is frozen by policy",
++                param_name,
++            )
++            allowed_parameter_names.append(set())
++            continue
+         logging.info(f"Matches for param_name [{param_name}]: {matching_parameters}")
+         allowed_parameter_names.append(matching_parameters)
+     return set.union(*allowed_parameter_names)
+diff --git a/sam3/train/trainer.py b/sam3/train/trainer.py
+index 59a8609..7da8f1e 100644
+--- a/sam3/train/trainer.py
++++ b/sam3/train/trainer.py
+@@ -23,6 +23,7 @@ from iopath.common.file_io import g_pathmgr
+ from sam3.model.data_misc import BatchedDatapoint
+ from sam3.model.model_misc import SAM3Output
+ from sam3.model.utils.misc import copy_data_to_device
++from sam3.train.data.collator import QueryMicrobatchGroup
+ from sam3.train.optim.optimizer import construct_optimizer
+ from sam3.train.utils.checkpoint_utils import (
+     assert_skipped_parameters_are_frozen,
+@@ -501,9 +502,12 @@ class Trainer:
+         batch: BatchedDatapoint,
+         model: nn.Module,
+         phase: str,
++        increment_step: bool = True,
+     ):
+-        # pyre-fixme[16]: `BatchedDatapoint` has no attribute `popitem`.
+-        key, batch = batch.popitem()
++        # Do not mutate collated dictionaries: query-microbatch padding may
++        # intentionally reuse a chunk for a zero-weight synchronization pass.
++        assert len(batch) == 1
++        key, batch = next(iter(batch.items()))
+         # pyre-fixme[16]: `Trainer` has no attribute `device`.
+         batch = copy_data_to_device(batch, self.device, non_blocking=True)
+ 
+@@ -535,7 +539,8 @@ class Trainer:
+                 self.steps[phase],
+             )
+ 
+-        self.steps[phase] += 1
++        if increment_step:
++            self.steps[phase] += 1
+ 
+         ret_tuple = {loss_str: loss}, batch_size, step_losses
+ 
+@@ -778,7 +783,10 @@ class Trainer:
+         data_times = []
+         phase = Phase.TRAIN
+ 
+-        iters_per_epoch = len(train_loader)
++        raw_iters_per_epoch = len(train_loader)
++        iters_per_epoch = raw_iters_per_epoch // self.gradient_accumulation_steps
++        if iters_per_epoch < 1:
++            raise RuntimeError("Not enough loader batches for gradient accumulation")
+ 
+         loss_names = []
+         for batch_key in self.loss.keys():
+@@ -806,7 +814,22 @@ class Trainer:
+         self.model.train()
+         end = time.time()
+ 
+-        for data_iter, batch in enumerate(train_loader):
++        loader_iter = iter(train_loader)
++        for data_iter in range(iters_per_epoch):
++            if self.gradient_accumulation_steps > 1:
++                batch = [next(loader_iter) for _ in range(self.gradient_accumulation_steps)]
++            else:
++                batch = next(loader_iter)
++            telemetry = os.environ.get("SAM3_RANK_TELEMETRY", "0") == "1"
++            if telemetry:
++                torch.cuda.synchronize()
++                telemetry_start = time.perf_counter()
++                telemetry_batch = next(iter(batch.values())) if isinstance(batch, dict) else batch
++                telemetry_queries = len(getattr(telemetry_batch, "find_text_batch", []))
++                telemetry_boxes = sum(
++                    int(x.num_boxes.sum().item())
++                    for x in getattr(telemetry_batch, "find_targets", [])
++                )
+             # measure data loading time
+             data_time_meter.update(time.time() - end)
+             data_times.append(data_time_meter.val)
+@@ -859,6 +882,22 @@ class Trainer:
+                 # applied if the gradients are infinite
+                 self.scaler.step(self.optim.optimizer)
+                 self.scaler.update()
++                if telemetry:
++                    torch.cuda.synchronize()
++                    record = {
++                        "rank": self.distributed_rank,
++                        "step": self.steps[phase],
++                        "wall_s": time.perf_counter() - telemetry_start,
++                        "data_s": float(data_time_meter.val),
++                        "queries": telemetry_queries,
++                        "boxes_masks": telemetry_boxes,
++                    }
++                    path = os.path.join(
++                        self.logging_conf.log_dir,
++                        f"rank_telemetry_{self.distributed_rank:04d}.jsonl",
++                    )
++                    with open(path, "a", encoding="utf-8") as telemetry_file:
++                        telemetry_file.write(json.dumps(record) + "\n")
+ 
+                 # measure elapsed time
+                 batch_time_meter.update(time.time() - end)
+@@ -928,7 +967,49 @@ class Trainer:
+         # gradients
+         self.optim.zero_grad(set_to_none=True)
+ 
+-        if self.gradient_accumulation_steps > 1:
++        is_query_microbatch = isinstance(batch, QueryMicrobatchGroup)
++        query_loss_wrapper = None
++        if is_query_microbatch:
++            assert self.gradient_accumulation_steps == 1, (
++                "query microbatching and ordinary gradient accumulation cannot be combined"
++            )
++            assert batch.chunks
++            actual_chunks = batch.chunks
++            local_num_boxes = 0
++            for microbatch in actual_chunks:
++                assert len(microbatch) == 1
++                _, datapoint = next(iter(microbatch.items()))
++                local_num_boxes += sum(
++                    int(target.num_boxes.sum().item())
++                    for target in datapoint.find_targets
++                )
++            key = next(iter(actual_chunks[0].keys()))
++            query_loss_wrapper = self._find_loss(key)
++            if not hasattr(query_loss_wrapper, "set_query_microbatch_normalization"):
++                raise TypeError(f"Loss for {key} does not support query microbatching")
++            query_loss_wrapper.set_query_microbatch_normalization(
++                torch.tensor(float(local_num_boxes), device=self.device),
++                batch.original_query_count,
++            )
++
++            global_chunk_count = torch.tensor(
++                len(actual_chunks), device=self.device, dtype=torch.long
++            )
++            torch.distributed.all_reduce(
++                global_chunk_count, op=torch.distributed.ReduceOp.MAX
++            )
++            execution_count = int(global_chunk_count.item())
++            # All ranks execute the same number of forwards/backwards. Ranks
++            # with fewer real chunks reuse their smallest final chunk at zero
++            # weight so DDP hooks and the final synchronized backward align.
++            batch = actual_chunks + [actual_chunks[-1]] * (
++                execution_count - len(actual_chunks)
++            )
++            chunk_weights = [1.0] * len(actual_chunks) + [0.0] * (
++                execution_count - len(actual_chunks)
++            )
++            accum_steps = execution_count
++        elif self.gradient_accumulation_steps > 1:
+             assert isinstance(batch, list), (
+                 f"Expected a list of batches, got {type(batch)}"
+             )
+@@ -941,17 +1022,23 @@ class Trainer:
+             # pyre-fixme[9]: batch has type `BatchedDatapoint`; used as
+             #  `List[BatchedDatapoint]`.
+             batch = [batch]
++            chunk_weights = [1.0]
++
++        if not is_query_microbatch and self.gradient_accumulation_steps > 1:
++            chunk_weights = [1.0 / accum_steps] * accum_steps
+ 
+         # pyre-fixme[6]: For 1st argument expected `Iterable[_T]` but got
+         #  `BatchedDatapoint`.
+-        for i, chunked_batch in enumerate(batch):
+-            ddp_context = (
+-                self.model.no_sync()
+-                if i < accum_steps - 1
+-                else contextlib.nullcontext()
+-            )
+-            with ddp_context:
+-                with torch.amp.autocast(
++        try:
++            for i, (chunked_batch, chunk_weight) in enumerate(
++                zip(batch, chunk_weights)
++            ):
++                ddp_context = (
++                    self.model.no_sync()
++                    if i < accum_steps - 1
++                    else contextlib.nullcontext()
++                )
++                with ddp_context, torch.amp.autocast(
+                     device_type="cuda",
+                     # pyre-fixme[16]: `Optional` has no attribute `enabled`.
+                     enabled=self.optim_conf.amp.enabled,
+@@ -962,31 +1049,43 @@ class Trainer:
+                         chunked_batch,
+                         self.model,
+                         phase,
++                        increment_step=not is_query_microbatch,
+                     )
+ 
+-                assert len(loss_dict) == 1
+-                loss_key, loss = loss_dict.popitem()
+-
+-                if not math.isfinite(loss.item()):
+-                    error_msg = f"Loss is {loss.item()}, attempting to stop training"
+-                    logging.error(error_msg)
+-                    if raise_on_error:
+-                        raise FloatingPointError(error_msg)
+-                    else:
+-                        return
+-
+-                self.scaler.scale(loss).backward()
+-                loss_mts[loss_key].update(loss.item(), batch_size)
+-                for extra_loss_key, extra_loss in extra_losses.items():
+-                    if extra_loss_key not in extra_loss_mts:
+-                        extra_loss_mts[extra_loss_key] = AverageMeter(
++                    assert len(loss_dict) == 1
++                    loss_key, loss = loss_dict.popitem()
++
++                    if not math.isfinite(loss.item()):
++                        error_msg = f"Loss is {loss.item()}, attempting to stop training"
++                        logging.error(error_msg)
++                        if raise_on_error:
++                            raise FloatingPointError(error_msg)
++                        else:
++                            return
++
++                    self.scaler.scale(loss * chunk_weight).backward()
++                    if chunk_weight != 0.0:
++                        loss_mts[loss_key].update(loss.item(), batch_size)
++                    for extra_loss_key, extra_loss in extra_losses.items():
++                        if chunk_weight == 0.0:
++                            continue
++                        if extra_loss_key not in extra_loss_mts:
++                            extra_loss_mts[extra_loss_key] = AverageMeter(
+                             # pyre-fixme[16]: `Trainer` has no attribute `device`.
+                             extra_loss_key,
+                             # pyre-fixme[16]: `Trainer` has no attribute `device`.
+                             self.device,
+                             ":.2e",
++                            )
++                        extra_loss_mts[extra_loss_key].update(
++                            extra_loss.item(), batch_size
+                         )
+-                    extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
++        finally:
++            if query_loss_wrapper is not None:
++                query_loss_wrapper.clear_query_microbatch_normalization()
++        if is_query_microbatch:
++            # One transformed image group, one optimizer step, one trainer step.
++            self.steps[phase] += 1
+ 
+     def _log_meters_and_save_best_ckpts(self, phases: List[str]):
+         logging.info("Synchronizing meters")
+@@ -1122,11 +1221,38 @@ class Trainer:
+         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
+ 
+     def _construct_optimizers(self):
++        trainable_names = {
++            name for name, param in self.model.named_parameters() if param.requires_grad
++        }
++        if not trainable_names:
++            raise RuntimeError("Freeze policy left no trainable parameters")
+         self.optim = construct_optimizer(
+             self.model,
+             self.optim_conf.optimizer,
+             self.optim_conf.options,
+             self.optim_conf.param_group_modifiers,
++            param_allowlist=trainable_names,
++            validate_param_groups=False,
++        )
++        expected = {
++            id(param)
++            for name, param in self.model.named_parameters()
++            if name in trainable_names
++        }
++        actual = {
++            id(param)
++            for group in self.optim.optimizer.param_groups
++            for param in group["params"]
++        }
++        if actual != expected:
++            raise RuntimeError(
++                "Optimizer/freeze mismatch: "
++                f"expected {len(expected)} trainable tensors, got {len(actual)}"
++            )
++        logging.info(
++            "SAM3 optimizer audit: %d trainable tensors, %d parameters",
++            len(trainable_names),
++            sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+         )
+ 
+     def _log_loss_detailed_and_return_core_loss(self, loss, loss_str, step):
